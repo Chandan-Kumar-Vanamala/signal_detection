@@ -7,3 +7,6 @@ data/
 # Python
 .venv/
 __pycache__/
+
+# Evaluation output (contains customer quotes)
+evaluation.txt

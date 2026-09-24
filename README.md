@@ -80,6 +80,45 @@ roughly 1.5 cents.
 
 ## Prompts
 
-Every prompt version is kept in `prompt/`. To try a change, copy the latest
-file to the next number (e.g. `Prompt_v3.txt`), edit it, and run with
-`--prompt v3`. Each result records which model, prompt and effort produced it.
+Every prompt version is kept in `prompt/`. **Never edit an old version** -
+results name the prompt they used, so changing a file in place makes old
+results misleading. To try a change:
+
+1. Copy the latest file to the next number, e.g. `Prompt_v3.txt`, and edit it.
+2. Run with `--prompt v3`. The run prints the signals and fields it read from
+   the prompt - check them before it finishes.
+3. Score it: `.venv/bin/python evaluate.py`.
+
+### What the code reads from a prompt (keep these three conventions)
+
+The code builds the model's input and the answer's JSON schema from the prompt
+itself, so adding or renaming signals needs **no code change** - as long as:
+
+1. **Signals** are listed under a line `SIGNALS`, one per line as
+   `<number>. <snake_case_name>`, with the definition indented below:
+   ```
+   SIGNALS
+
+   1. competitor_mention
+      The customer references another provider ...
+   4. no_response
+      The customer ...
+   ```
+2. **Input fields** follow a line containing `Each item has:`, one per line as
+   `- <field> : <meaning>`, ending at a blank line. Only these fields are sent.
+   Fields available in the timelines: `ref, id, date, date_estimated, kind,
+   source, role, author, level, store_ids, stores, subject, text, truncated`
+   (the run warns if the prompt names one that doesn't exist).
+3. **The answer shape** is shown under a line `OUTPUT` as a JSON example. The
+   keys inside the first `"evidence": [ { ... } ]` become the evidence fields;
+   it must include `"quote"`, and should include `"ref"` (or `"id"`) so each
+   quote can be checked against its activity. `id` is a number, every other
+   evidence field is text. Every signal has `"evidence"` and `"present"`.
+
+To **score** a new signal, add it to each company in `data/labels.json`
+(`"present"` plus the `"evidence"` refs). Signals without labels are still
+detected and saved, just not scored.
+
+Things that *do* need a code change: new kinds of input data (e.g. company
+category tags, which aren't in the timelines yet), or an answer shape beyond
+evidence + present per signal.

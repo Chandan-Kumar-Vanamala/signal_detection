@@ -192,10 +192,106 @@ def strip_boilerplate(text):
 
 
 # --------------------------------------------------------------------------- #
+# Stores: is an activity about one store, or the whole group?                  #
+# --------------------------------------------------------------------------- #
+
+# "Related Companies" in the company record lists the group's stores:
+#   "Maple Honda (#100000001); Maple Kia (#100000002); ..."
+RELATED_COMPANY = re.compile(r"\s*(.+?)\s*\(#(\d+)\)\s*$")
+
+# Related companies that are groups or management companies, not stores.
+SUB_GROUP = re.compile(r"\b(auto group|automotive group|management|dealer group)\b", re.I)
+
+# Shorthand used in project names, e.g. "Airport CDJR", "Maple BGMC Cadillac".
+ABBREVIATIONS = {"cdjr": "chrysler dodge jeep ram", "cdj": "chrysler dodge jeep",
+                 "bgmc": "buick gmc", "vw": "volkswagen", "chevy": "chevrolet"}
+IGNORED_WORDS = {"of", "the", "and", "nlop", "ca", "mo"}
+
+# An activity naming at least this share of the group's stores is about the group.
+GROUP_SHARE = 0.75
+
+
+def name_tokens(name):
+    """'NLOP_Airport CDJR' -> {'airport', 'chrysler', 'dodge', 'jeep', 'ram'}"""
+    words = re.findall(r"[a-z0-9]+", name.lower().replace("_", " "))
+    words = " ".join(ABBREVIATIONS.get(w, w) for w in words).split()
+    return {w for w in words if w not in IGNORED_WORDS}
+
+
+def store_directory(info):
+    """The company's stores as [{'id', 'name', 'active'}]. A solo store is its own store."""
+    if info["Company Type"] == "Solo Store":
+        return [{"id": info["Company ID"], "name": info["Company Name"], "active": True}]
+    stores = []
+    for part in value(info.get("Related Companies")).split(";"):
+        found = RELATED_COMPANY.match(part)
+        if found and not SUB_GROUP.search(found[1]):
+            name = found[1]
+            stores.append({"id": int(found[2]), "name": name,
+                           "active": not name.upper().startswith("NLOP")})
+    return stores
+
+
+def match_store(name, directory):
+    """Best store in the directory for a name as written in an activity, or None.
+
+    Handles project names ("Maple Subaru: Parts R6"), group prefixes
+    ("MapleAG_Maple Honda"), NLOP_ markers and shorthand ("Airport CDJR").
+    """
+    name = name.split(":")[0]                          # drop the project part
+    tokens = name_tokens(name)
+    if not tokens:
+        return None
+    best, best_score = None, 0.0
+    for store in directory:
+        store_tokens = name_tokens(store["name"])
+        score = len(tokens & store_tokens) / len(tokens | store_tokens)
+        if score > best_score:
+            best, best_score = store, score
+    return best if best_score >= 0.7 else None
+
+
+def stores_named_in(text, directory):
+    """Stores whose full name appears in free text, e.g. an email subject like
+    "RE: Project Restart Reminder - Maple Honda Parts"."""
+    words = name_tokens(text)
+    return [s for s in directory if len(name_tokens(s["name"])) >= 2 and name_tokens(s["name"]) <= words]
+
+
+def store_level(a, text, info, directory, subject=""):
+    """Work out which store(s) an activity is about.
+
+    Looks at the activity's Group and Stores values (and an email's subject),
+    matched against the store list. Pieces that match no store - contact names,
+    or the details text the export sometimes copies into Stores - are ignored.
+    Returns {"level": "store"|"group", "store_ids": [...], "stores": "names"}.
+    """
+    group_name = info["Company Name"]
+    if info["Company Type"] == "Solo Store":
+        return {"level": "store", "store_ids": [info["Company ID"]], "stores": group_name}
+
+    names = [value(a["Group"])] + value(a["Stores"]).split(", ")
+    matched = {}
+    for name in names:
+        store = match_store(name, directory) if name and name != group_name else None
+        if store:
+            matched[store["id"]] = store["name"]
+    for store in stores_named_in(subject, directory) if subject else []:
+        matched[store["id"]] = store["name"]
+
+    all_stores = "ALL STORES" in text.upper()
+    if all_stores or not matched or (len(matched) > 1 and
+                                     len(matched) >= GROUP_SHARE * len(directory)):
+        return {"level": "group", "store_ids": [], "stores": group_name}
+    return {"level": "store", "store_ids": sorted(matched),
+            "stores": ", ".join(matched[i] for i in sorted(matched))}
+
+
+# --------------------------------------------------------------------------- #
 # Building the timeline                                                        #
 # --------------------------------------------------------------------------- #
 
-def from_activity(a):
+def from_activity(a, info, directory):
     text = "\n".join(dict.fromkeys(p for p in (value(a["Title"]), value(a["Details"])) if p))
     if not text:
         return None
@@ -206,7 +302,7 @@ def from_activity(a):
         "kind": KINDS.get(a["Type"], a["Type"].lower()),
         "role": "adu",
         "author": value(a["Assigned To"]),
-        "stores": value(a["Stores"]) or value(a["Group"]),
+        **store_level(a, text, info, directory),
         "subject": None,
         "text": redact(text),
     }
@@ -224,7 +320,7 @@ def message_key(role, text):
     return fingerprint(role, opening)
 
 
-def from_emails(emails, staff):
+def from_emails(emails, staff, info, directory):
     """One activity per unique message across all of a company's emails."""
     newest_first = sorted(emails, key=lambda a: a["Date"], reverse=True)
     by_print = {}
@@ -247,7 +343,7 @@ def from_emails(emails, staff):
                     "kind": "email",
                     "role": m["role"],
                     "author": m["author"],
-                    "stores": value(e["Stores"]) or value(e["Group"]),
+                    **store_level(e, value(e["Message"]), info, directory, value(e["Details"])),
                     "subject": value(e["Details"]),     # the portal puts the subject here
                     "text": redact(m["text"]),
                     "truncated": truncated,
@@ -263,8 +359,10 @@ def from_emails(emails, staff):
 def build_company(company, staff):
     info = company["Company"][0]
     raw = company["Activities"]
-    activities = [x for a in raw if a["Type"] != "Email" for x in [from_activity(a)] if x]
-    activities += from_emails([a for a in raw if a["Type"] == "Email"], staff)
+    directory = store_directory(info)
+    activities = [x for a in raw if a["Type"] != "Email"
+                  for x in [from_activity(a, info, directory)] if x]
+    activities += from_emails([a for a in raw if a["Type"] == "Email"], staff, info, directory)
     activities.sort(key=lambda x: (x["date"] is None, x["date"] or ""))
     # Short ids - 1, 2, 3 ... in date order - that a model can copy without
     # mistakes. "ref" keeps the long original id for tracing back to the source.
@@ -274,6 +372,7 @@ def build_company(company, staff):
         "company_name": info["Company Name"],
         "company_type": info["Company Type"],
         "number_of_stores": info["Number Of Stores"],
+        "store_list": directory,
         "count": len(activities),
         "activities": activities,
     }
@@ -297,3 +396,4 @@ if __name__ == "__main__":
               f"(non-email {n(source='activity'):>3}, email ADU {n(source='email', role='adu'):>3}, "
               f"email dealer {n(source='email', role='dealer'):>3}, truncated {n(truncated=True):>3})  "
               f"{dates[0][:10]} -> {dates[-1][:10]}")
+        print(f"  {'':<28} level: store {n(level='store'):>4}, group {n(level='group'):>4}")

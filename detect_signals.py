@@ -10,6 +10,11 @@ Usage:
     python detect_signals.py 176676003                      # one company
     python detect_signals.py --model gpt-5-nano --prompt v1 --effort low
     python detect_signals.py --repeat 3                     # 3 runs, to check consistency
+    python detect_signals.py --years 3                      # look back 3 years instead of 2
+    python detect_signals.py --since 2025-01-01             # or from a fixed date
+
+Only recent activity is sent to the model (default: the last 2 years). The
+timelines themselves keep the full history.
 """
 
 import argparse
@@ -17,7 +22,7 @@ import json
 import os
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -34,6 +39,8 @@ DEFAULT_PROMPT_VERSION = "v2"
 # GPT-5 models think before answering, and that thinking is billed as output.
 # "medium" found signals that "low" missed.
 DEFAULT_EFFORT = "medium"
+# Signals are judged on recent activity only: the last N years before today.
+DEFAULT_YEARS = 2
 # Hard cap on thinking + answer, so one bad call can't run up a big bill.
 MAX_OUTPUT_TOKENS = 16_000
 
@@ -44,47 +51,68 @@ SERVICE_TIER = "flex"
 TIMEOUT_SECONDS = 15 * 60
 MAX_RETRIES = 5
 
-# Only the fields the prompt describes. Everything else (author names and
-# addresses, source, seen_in...) stays out: smaller input, and no personal
-# details the prompt tells the model never to quote anyway.
-FIELDS = ["id", "date", "kind", "role", "stores", "subject", "text", "truncated"]
-
-
 # --------------------------------------------------------------------------- #
-# The answer's shape - the same JSON the prompt asks for, as a schema the API #
-# enforces. The model cannot return anything that doesn't fit it.            #
+# Reading the prompt: it defines the signals, the input fields and the answer #
+# shape, so a new prompt version needs no code change.                        #
 # --------------------------------------------------------------------------- #
 
-EVIDENCE = {
-    "type": "object",
-    "properties": {
-        "id": {"type": "integer"},
-        "happened_on": {"type": "string"},
-        "stores": {"type": "string"},
-        "quote": {"type": "string"},
-    },
-    "required": ["id", "happened_on", "stores", "quote"],
-    "additionalProperties": False,
-}
+HEADING = re.compile(r"^[A-Z][A-Z ]{2,}$", re.M)            # e.g. "SIGNALS", "OUTPUT"
+SIGNAL_LINE = re.compile(r"^\s*\d+\.\s+([a-z][a-z0-9_]*)\s*$", re.M)   # "1. churn_language"
+FIELD_LINE = re.compile(r"^-\s+([a-z][a-z0-9_]*)\s*:", re.M)             # "- ref   : ..."
+JSON_KEY = re.compile(r'"([a-z][a-z0-9_]*)"\s*:')
 
-SIGNAL = {
-    "type": "object",
-    "properties": {
-        "evidence": {"type": "array", "items": EVIDENCE},
-        "present": {"type": "boolean"},
-    },
-    "required": ["evidence", "present"],
-    "additionalProperties": False,
-}
 
-SIGNAL_NAMES = ["competitor_mention", "in_house_intent", "churn_language"]
+def sections(prompt):
+    """{"SIGNALS": "...text...", "OUTPUT": "...", ...} split at the ALL-CAPS headings."""
+    marks = list(HEADING.finditer(prompt))
+    return {m.group(0).strip(): prompt[m.end():nxt.start() if nxt else len(prompt)]
+            for m, nxt in zip(marks, marks[1:] + [None])}
 
-SCHEMA = {
-    "type": "object",
-    "properties": {name: SIGNAL for name in SIGNAL_NAMES},
-    "required": SIGNAL_NAMES,
-    "additionalProperties": False,
-}
+
+def read_prompt(prompt):
+    """What the prompt asks for: signal names, input fields, evidence fields."""
+    parts = sections(prompt)
+    signals = SIGNAL_LINE.findall(parts.get("SIGNALS", ""))
+
+    # Input fields: the "- name : meaning" list that follows "Each item has:".
+    after = prompt.split("Each item has:", 1)[1] if "Each item has:" in prompt else ""
+    fields = FIELD_LINE.findall(after.split("\n\n", 1)[0])
+
+    # Evidence fields: the keys inside the first "evidence": [ { ... } ] of OUTPUT.
+    output = parts.get("OUTPUT", "")
+    first_evidence = output.split('"evidence"', 1)[1].split("]", 1)[0] if '"evidence"' in output else ""
+    evidence = JSON_KEY.findall(first_evidence)
+
+    missing = [n for n, v in (("signals (SIGNALS: '1. name')", signals),
+                              ("input fields ('Each item has:' list)", fields),
+                              ("evidence fields (OUTPUT example)", evidence)) if not v]
+    if missing:
+        raise ValueError(f"could not read from the prompt: {', '.join(missing)}")
+    return {"signals": signals, "fields": fields, "evidence": evidence}
+
+
+def answer_schema(spec):
+    """The JSON the prompt asks for, as a schema the API enforces (strict mode).
+    The model cannot return anything that doesn't fit it."""
+    evidence = {
+        "type": "object",
+        "properties": {f: {"type": "integer" if f == "id" else "string"} for f in spec["evidence"]},
+        "required": spec["evidence"],
+        "additionalProperties": False,
+    }
+    signal = {
+        "type": "object",
+        "properties": {"evidence": {"type": "array", "items": evidence},
+                       "present": {"type": "boolean"}},
+        "required": ["evidence", "present"],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {name: signal for name in spec["signals"]},
+        "required": spec["signals"],
+        "additionalProperties": False,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -100,10 +128,11 @@ def load_timeline(company_id):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def prepare_activity(activity):
-    """Keep the prompt's fields; drop empty ones so every token carries meaning."""
+def prepare_activity(activity, fields):
+    """Keep only the fields the prompt describes; drop empty ones so every token
+    carries meaning. Anything the prompt doesn't list never reaches the model."""
     out = {}
-    for field in FIELDS:
+    for field in fields:
         v = activity.get(field)
         if v in (None, "", False):        # no subject, not truncated, ...
             continue
@@ -111,11 +140,17 @@ def prepare_activity(activity):
     return out
 
 
-def prepare_input(timeline):
-    """The JSON text the model will read: the list of activities, oldest first."""
-    activities = [prepare_activity(a) for a in timeline["activities"] if a["text"].strip()]
+def prepare_input(timeline, fields, since):
+    """The JSON text the model will read: {"activities": [...]}, oldest first.
+
+    Only activities dated on or after `since` (YYYY-MM-DD) with some text.
+    Ids are kept as they are in the timeline, so they still match it.
+    """
+    activities = [prepare_activity(a, fields) for a in timeline["activities"]
+                  if a["text"].strip() and (a["date"] or "") >= since]
     # separators=(",", ":") drops the spaces json.dumps adds by default.
-    return json.dumps(activities, ensure_ascii=False, separators=(",", ":")), len(activities)
+    data = json.dumps({"activities": activities}, ensure_ascii=False, separators=(",", ":"))
+    return data, len(activities)
 
 
 # --------------------------------------------------------------------------- #
@@ -127,40 +162,57 @@ def normalise(text):
     return re.sub(r"\s+", " ", text).strip().strip(".,;:!?\"'“”‘’ ")
 
 
-def check_evidence(evidence, activities):
-    """List what's wrong with one piece of evidence. An empty list means it's good."""
-    activity = activities.get(evidence["id"])
-    if activity is None:
-        return ["activity id not in the data"]
+NOT_FOUND = "activity not in the data"
+QUOTE_MISSING = "quote not found in the activity's text"
+SERIOUS = (NOT_FOUND, QUOTE_MISSING)          # these make a piece of evidence invalid
 
-    evidence["ref"] = activity["ref"]          # the original long id, for tracing back
+
+def find_activity(evidence, by_ref, by_id):
+    """The cited activity: by ref when the answer has one (stable), else by id."""
+    if evidence.get("ref") in by_ref:
+        return by_ref[evidence["ref"]]
+    return by_id.get(evidence.get("id"))
+
+
+def check_evidence(evidence, by_ref, by_id):
+    """List what's wrong with one piece of evidence. An empty list means it's good."""
+    activity = find_activity(evidence, by_ref, by_id)
+    if activity is None:
+        return [NOT_FOUND]
+
     problems = []
-    if normalise(evidence["quote"]) not in normalise(activity["text"]):
-        problems.append("quote not found in the activity's text")
+    if "id" in evidence and "ref" in evidence and evidence["id"] != activity["id"]:
+        problems.append(f"id should be {activity['id']} for this ref")
+    evidence["ref"] = activity["ref"]          # the original long id, for tracing back
+    evidence["level"] = activity.get("level")  # "store" or "group"
+    evidence["store_ids"] = activity.get("store_ids", [])
+
+    if normalise(evidence.get("quote", "")) not in normalise(activity["text"]) or not evidence.get("quote"):
+        problems.append(QUOTE_MISSING)
     if activity["role"] == "adu" and activity["kind"] == "email":
-        problems.append("cites our own outbound email, not the customer")
-    if evidence["happened_on"] != (activity["date"] or "")[:10]:
+        # Allowed only as a recap of what the customer told us - worth a human look.
+        problems.append("our own outbound email - check it restates the customer")
+    if "happened_on" in evidence and evidence["happened_on"] != (activity["date"] or "")[:10]:
         problems.append(f"date should be {(activity['date'] or '')[:10]}")
-    if evidence["stores"] != activity.get("stores", ""):
+    if "stores" in evidence and evidence["stores"] != activity.get("stores", ""):
         problems.append("stores does not match the activity")
     return problems
 
 
-def verify(signals, timeline):
+def verify(signals, timeline, signal_names):
     """Add a check to every piece of evidence, and a 'confirmed' flag per signal.
 
-    confirmed = at least one piece of evidence passed the quote and source
-    checks. A wrong date or stores value alone doesn't sink it - the quote
-    being real is what matters.
+    confirmed = at least one piece of evidence points at a real activity whose
+    text contains the quote. Other problems (wrong date, our own email) are
+    noted for review but don't sink the evidence.
     """
-    activities = {a["id"]: a for a in timeline["activities"]}
-    serious = ("activity id not in the data", "quote not found in the activity's text",
-               "cites our own outbound email, not the customer")
-    for name in SIGNAL_NAMES:
+    by_ref = {a["ref"]: a for a in timeline["activities"]}
+    by_id = {a["id"]: a for a in timeline["activities"]}
+    for name in signal_names:
         signal = signals[name]
         for evidence in signal["evidence"]:
-            evidence["problems"] = check_evidence(evidence, activities)
-            evidence["verified"] = not any(p in serious for p in evidence["problems"])
+            evidence["problems"] = check_evidence(evidence, by_ref, by_id)
+            evidence["verified"] = not any(p in SERIOUS for p in evidence["problems"])
         signal["confirmed"] = any(e["verified"] for e in signal["evidence"])
         if signal["present"] != bool(signal["evidence"]):
             signal["note"] = "model's 'present' did not match its evidence"
@@ -171,7 +223,7 @@ def verify(signals, timeline):
 # Calling the model                                                            #
 # --------------------------------------------------------------------------- #
 
-def detect(client, model, prompt, effort, data):
+def detect(client, model, prompt, schema, effort, data):
     """Send one company's activities to the model. Returns (signals, usage)."""
     response = client.responses.create(
         model=model,
@@ -181,7 +233,7 @@ def detect(client, model, prompt, effort, data):
         max_output_tokens=MAX_OUTPUT_TOKENS,
         service_tier=SERVICE_TIER,
         text={"format": {"type": "json_schema", "name": "signals",
-                         "schema": SCHEMA, "strict": True}},
+                         "schema": schema, "strict": True}},
     )
     if response.status != "completed":
         reason = getattr(response.incomplete_details, "reason", response.status)
@@ -219,9 +271,22 @@ def parse_args():
     parser.add_argument("--effort", default=DEFAULT_EFFORT,
                         choices=["minimal", "low", "medium", "high"],
                         help=f"reasoning effort (default: {DEFAULT_EFFORT})")
+    parser.add_argument("--years", type=int, default=DEFAULT_YEARS,
+                        help=f"only send activity from the last N years (default: {DEFAULT_YEARS})")
+    parser.add_argument("--since", help="only send activity from this date on, YYYY-MM-DD "
+                                        "(overrides --years)")
     parser.add_argument("--repeat", type=int, default=1,
                         help="run everything this many times, each in its own folder")
     return parser.parse_args()
+
+
+def years_ago(years):
+    """The date `years` years before today, as YYYY-MM-DD (29 Feb -> 28 Feb)."""
+    today = date.today()
+    try:
+        return today.replace(year=today.year - years).isoformat()
+    except ValueError:
+        return today.replace(year=today.year - years, day=28).isoformat()
 
 
 def next_run_name(base):
@@ -237,29 +302,46 @@ if __name__ == "__main__":
     args = parse_args()
     model = args.model or os.environ["OPENAI_MODEL"]
     prompt = prompt_file(args.prompt).read_text(encoding="utf-8")
+    spec = read_prompt(prompt)                 # signals, input fields, evidence fields
+    schema = answer_schema(spec)
+    if "quote" not in spec["evidence"]:
+        raise ValueError('the OUTPUT example must include "quote" - it is how evidence is checked')
+    print(f"Prompt {args.prompt}: signals {spec['signals']}\n"
+          f"  sends fields {spec['fields']}\n  evidence fields {spec['evidence']}\n")
     client = OpenAI(timeout=TIMEOUT_SECONDS, max_retries=MAX_RETRIES)
+    since = args.since or years_ago(args.years)
+    print(f"Activity window: {since} to today\n")
 
     company_ids = args.companies or \
                   [int(p.stem.split("_")[1]) for p in sorted(TIMELINE_DIR.glob("company_*.json"))]
+
+    # Warn about fields the prompt describes but the timelines don't have -
+    # the model would be told about them but never see them.
+    sample = load_timeline(company_ids[0])["activities"]
+    known = set().union(*(a.keys() for a in sample))
+    unknown = [f for f in spec["fields"] if f not in known]
+    if unknown:
+        print(f"WARNING: the prompt lists fields the timelines don't have: {unknown}\n"
+              f"  available: {sorted(known)}\n")
 
     for _ in range(args.repeat):
         run = next_run_name(f"{model}_{args.prompt}_{args.effort}")
         run_dir = RUNS_DIR / run
         settings = {"run": run, "model": model, "prompt": prompt_file(args.prompt).name,
-                    "effort": args.effort}
+                    "effort": args.effort, "since": since, "signals_requested": spec["signals"]}
         print(f"=== run {run} ===\n")
 
         for company_id in company_ids:
             timeline = load_timeline(company_id)
-            data, count = prepare_input(timeline)
-            print(f"{timeline['company_name']}: sending {count} activities (~{len(data) // 4:,} tokens) "
-                  f"to {model}...")
+            data, count = prepare_input(timeline, spec["fields"], since)
+            print(f"{timeline['company_name']}: sending {count} of {timeline['count']} activities "
+                  f"(since {since}, ~{len(data) // 4:,} tokens) to {model}...")
 
-            signals, usage = detect(client, model, prompt, args.effort, data)
-            signals = verify(signals, timeline)
+            signals, usage = detect(client, model, prompt, schema, args.effort, data)
+            signals = verify(signals, timeline, spec["signals"])
             path = save(run_dir, timeline, settings, signals, usage, count)
 
-            for name in SIGNAL_NAMES:
+            for name in spec["signals"]:
                 s = signals[name]
                 good = sum(e["verified"] for e in s["evidence"])
                 print(f"  {name:<20} present={str(s['present']):<5}  confirmed={str(s['confirmed']):<5}  "

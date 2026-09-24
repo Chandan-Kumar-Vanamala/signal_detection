@@ -9,7 +9,8 @@ Two levels of scoring:
   * evidence - did the run cite the activities the answer key names?
 
 Only evidence that passed the checker (verified) counts - a signal is "yes"
-when the run's "confirmed" flag is true.
+when the run's "confirmed" flag is true. The signals scored are the ones in
+labels.json; a signal the run wasn't asked for counts as "not detected".
 
 Usage:
     python evaluate.py                    # every run in data/runs
@@ -26,9 +27,6 @@ ROOT = Path(__file__).parent
 LABELS_FILE = ROOT / "data" / "labels.json"
 RUNS_DIR = ROOT / "data" / "runs"
 TIMELINE_DIR = ROOT / "data" / "timeline"
-
-SIGNAL_NAMES = ["competitor_mention", "in_house_intent", "churn_language"]
-
 
 def load_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
@@ -56,10 +54,11 @@ def score_run(run_dir, labels):
         result = load_json(path)["signals"]
         texts = text_by_ref(company_id)
 
-        for name in SIGNAL_NAMES:
+        for name in [k for k in truth if k != "name"]:           # signals labelled
             expected = truth[name]["present"]
-            said = result[name]["confirmed"]
-            cited = {e["ref"] for e in result[name]["evidence"] if e.get("verified")}
+            answer = result.get(name, {"confirmed": False, "evidence": []})
+            said = answer["confirmed"]
+            cited = {e["ref"] for e in answer["evidence"] if e.get("verified")}
             cited_texts = [texts.get(r, "") for r in cited]
 
             # --- signal level ---
