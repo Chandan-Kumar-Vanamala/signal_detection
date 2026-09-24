@@ -1,0 +1,9 @@
+# Secrets
+.env
+
+# Real customer data exported from production
+data/
+
+# Python
+.venv/
+__pycache__/
