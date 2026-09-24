@@ -219,6 +219,26 @@ def verify(signals, timeline, signal_names):
     return signals
 
 
+def label_with_status(signals, timeline, signal_names):
+    """Label the answer with the CRM's account status (not something the model sees).
+
+    * Churn-type signals get churn_type: "churn risk" on a current customer,
+      "already lost" on an account the CRM already marks as lost.
+    * Evidence tied only to inactive stores (NLOP_...) gets store_active: false.
+    """
+    status = timeline.get("account_status", {}).get("status")
+    active = {s["id"]: s["active"] for s in timeline.get("store_list", [])}
+    for name in signal_names:
+        signal = signals[name]
+        if "churn" in name and signal["confirmed"]:
+            signal["churn_type"] = "already lost" if status == "lost" else "churn risk"
+        for evidence in signal["evidence"]:
+            ids = evidence.get("store_ids") or []
+            if ids:
+                evidence["store_active"] = any(active.get(i, True) for i in ids)
+    return signals
+
+
 # --------------------------------------------------------------------------- #
 # Calling the model                                                            #
 # --------------------------------------------------------------------------- #
@@ -251,7 +271,8 @@ def save(run_dir, timeline, settings, signals, usage, count):
         "company_id": timeline["company_id"],
         "company_name": timeline["company_name"],
         "detected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        **settings,                          # model, prompt, effort, run
+        "account_status": timeline.get("account_status", {}).get("status"),
+        **settings,                          # model, prompt, effort, run, since
         "activities_sent": count,
         "usage": usage,
         "signals": signals,
@@ -339,6 +360,7 @@ if __name__ == "__main__":
 
             signals, usage = detect(client, model, prompt, schema, args.effort, data)
             signals = verify(signals, timeline, spec["signals"])
+            signals = label_with_status(signals, timeline, spec["signals"])
             path = save(run_dir, timeline, settings, signals, usage, count)
 
             for name in spec["signals"]:
@@ -349,5 +371,8 @@ if __name__ == "__main__":
                 for e in s["evidence"]:
                     if e["problems"]:
                         print(f"      {e['id']}: {'; '.join(e['problems'])}")
+            churn = [f"{n}: {signals[n]['churn_type']}" for n in spec["signals"] if "churn_type" in signals[n]]
+            if churn:
+                print(f"  account: {timeline['account_status']['status']}  ->  {', '.join(churn)}")
             print(f"  tier: {usage['service_tier']}  tokens: {usage['input_tokens']:,} in, "
                   f"{usage['output_tokens']:,} out -> {path.relative_to(ROOT)}\n")

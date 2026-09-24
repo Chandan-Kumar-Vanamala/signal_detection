@@ -119,6 +119,16 @@ To **score** a new signal, add it to each company in `data/labels.json`
 (`"present"` plus the `"evidence"` refs). Signals without labels are still
 detected and saved, just not scored.
 
+### Account status
+
+Each timeline carries `account_status` from the company record (category tags,
+Lost On, Reason For Lost Op, Competition). An account is **lost** when it has a
+Lost On date later than any Sold On / Resumed On date, or is not tagged
+Customer; otherwise it is a **current customer**. The model never sees this.
+Results use it to label churn: `"churn_type": "churn risk"` on a current
+customer, `"already lost"` on a lost account. Evidence tied only to inactive
+(`NLOP_`) stores gets `"store_active": false`.
+
 Things that *do* need a code change: new kinds of input data (e.g. company
 category tags, which aren't in the timelines yet), or an answer shape beyond
 evidence + present per signal.

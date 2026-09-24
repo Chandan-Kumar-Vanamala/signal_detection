@@ -288,6 +288,35 @@ def store_level(a, text, info, directory, subject=""):
 
 
 # --------------------------------------------------------------------------- #
+# Account status: current customer, or already lost?                           #
+# --------------------------------------------------------------------------- #
+
+def account_status(info):
+    """The CRM's own view of the account, from the company record.
+
+    status = "lost" when the account has a Lost On date later than any Sold On /
+    Resumed On date (it was not won back), or it is not tagged Customer.
+    Otherwise "current customer". Kept out of the model's input - it is used to
+    label the results (e.g. churn on a lost account is "already lost").
+    """
+    labels = [l.strip() for l in value(info.get("Category Labels")).split(",") if l.strip()]
+    is_customer = "Customer" in labels
+    lost_on = value(info.get("Lost On"))
+    won_back = max(value(info.get("Sold On")), value(info.get("Resumed On")))
+    lost = bool(lost_on) and lost_on > won_back
+    return {
+        "status": "lost" if lost or not is_customer else "current customer",
+        "category_labels": labels,
+        "is_customer": is_customer,
+        "lost_on": lost_on or None,
+        "reason_lost": value(info.get("Reason For Lost Op")) or None,
+        "competition": value(info.get("Competition")) or None,
+        "sold_on": value(info.get("Sold On")) or None,
+        "resumed_on": value(info.get("Resumed On")) or None,
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Building the timeline                                                        #
 # --------------------------------------------------------------------------- #
 
@@ -372,6 +401,7 @@ def build_company(company, staff):
         "company_name": info["Company Name"],
         "company_type": info["Company Type"],
         "number_of_stores": info["Number Of Stores"],
+        "account_status": account_status(info),
         "store_list": directory,
         "count": len(activities),
         "activities": activities,
@@ -396,4 +426,5 @@ if __name__ == "__main__":
               f"(non-email {n(source='activity'):>3}, email ADU {n(source='email', role='adu'):>3}, "
               f"email dealer {n(source='email', role='dealer'):>3}, truncated {n(truncated=True):>3})  "
               f"{dates[0][:10]} -> {dates[-1][:10]}")
-        print(f"  {'':<28} level: store {n(level='store'):>4}, group {n(level='group'):>4}")
+        print(f"  {'':<28} level: store {n(level='store'):>4}, group {n(level='group'):>4}   "
+              f"account: {t['account_status']['status']}")
